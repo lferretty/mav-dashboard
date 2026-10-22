@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tasas operadas en el MAV</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f2f4f6;--panel:#fff;--ink:#14212b;--mute:#5d6b76;--line:#d9dfe4;--accent:#0b5fa5}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "IBM Plex Sans",system-ui,sans-serif;font-variant-numeric:tabular-nums}
+main{max-width:1200px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:26px;margin:0 0 4px;font-weight:600}
+.sub{color:var(--mute);margin:0 0 20px}
+.filtros{display:flex;flex-wrap:wrap;gap:12px;align-items:end;background:var(--panel);border:1px solid var(--line);padding:14px;border-radius:6px}
+label{display:flex;flex-direction:column;font-size:13px;color:var(--mute);gap:4px}
+input,select,button{font:inherit;padding:7px 9px;border:1px solid var(--line);border-radius:4px;background:#fff;color:var(--ink)}
+button{cursor:pointer}
+button:hover{border-color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#estado{font-size:13px;color:var(--mute);margin-top:8px;min-height:20px}
+section{margin-top:24px}
+h2{font-size:17px;margin:0 0 8px;font-weight:600}
+.tabla{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:6px;max-height:560px}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:7px 10px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--line)}
+th{background:#eaeef1;font-weight:600;position:sticky;top:0}
+td.n,th.n{text-align:right}
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px}
+.leyenda{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;margin-top:6px}
+.leyenda i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px}
+.vacio{padding:20px;color:var(--mute)}
+.nota{font-size:12.5px;color:var(--mute);margin:6px 2px 0}
+</style>
+</head>
+<body>
+<main>
+  <h1>Tasas operadas en el MAV</h1>
+  <p class="sub" id="sub">Cargando histórico…</p>
+
+  <div class="filtros">
+    <label>Desde <input type="date" id="desde"></label>
+    <label>Hasta <input type="date" id="hasta"></label>
+    <label>Instrumento <select id="instrumento"></select></label>
+    <label>Moneda <select id="moneda"></select></label>
+    <label>Segmento <select id="segmento"></select></label>
+    <button id="btnUltima" type="button">Última rueda</button>
+    <button id="btnTodo" type="button">Todo 2026</button>
+    <button id="btnCsv" type="button">Descargar CSV</button>
+    <button id="btnJson" type="button">Guardar histórico (JSON)</button>
+  </div>
+  <div id="estado" role="status"></div>
+
+  <section>
+    <h2>Resumen del período</h2>
+    <div class="tabla" id="resumen"></div>
+    <p class="nota">La tasa ponderada usa el monto de cada operación como peso. Cada fila resume un instrumento en una sola moneda.</p>
+  </section>
+
+  <section>
+    <h2>Evolución de la TEA ponderada</h2>
+    <div class="chart" id="grafico"></div>
+  </section>
+
+  <section>
+    <h2>Operaciones</h2>
+    <div class="tabla" id="detalle"></div>
+  </section>
+</main>
+
+<script>
+const PROXY = "https://mav-proxy.vercel.app/api/subastas";
+const DESDE_ANIO = "2026-01-01";
+const COLORES = ["#0b5fa5", "#1f7a5c", "#7a3fb0", "#b8860b", "#c0392b", "#4a5b68"];
+const CAMPOS = ["id_subasta","fecha","instrumento","segmento","moneda","tasa_compradora","tasa_vendedora","tasa_tea","tasa_tem","monto","ppv","agente_comprador","agente_vendedor","razon_social_responsable","tipo_gtia","calificado","canje"];
+const $ = (id) => document.getElementById(id);
+let filas = [], consultadas = new Set(), extra = { filas: [], consultadas: [] }, modoUltima = true;
+
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const nf = (v, d = 2) => v == null ? "–" : Number(v).toLocaleString("es-AR", { minimumFractionDigits: d, maximumFractionDigits: d });
+const reducir = (s) => Object.fromEntries(CAMPOS.map((c) => [c, s[c] ?? null]));
+const sumarDias = (f, n) => { const d = new Date(f + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+const esHabil = (f) => { const w = new Date(f + "T00:00:00Z").getUTCDay(); return w > 0 && w < 6; };
+const estado = (t) => { $("estado").textContent = t; };
+
+function ultimaRueda() {
+  const p = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Argentina/Buenos_Aires", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false }).formatToParts(new Date());
+  const g = (t) => p.find((x) => x.type === t).value;
+  const hoy = `${g("year")}-${g("month")}-${g("day")}`;
+  return Number(g("hour")) % 24 >= 17 ? hoy : sumarDias(hoy, -1);
+}
+
+function agregar(nuevas, fechas) {
+  const ids = new Set(filas.map((f) => f.id_subasta));
+  for (const f of nuevas) if (!ids.has(f.id_subasta)) { filas.push(f); ids.add(f.id_subasta); }
+  fechas.forEach((f) => consultadas.add(f));
+}
+
+function guardarExtra() {
+  try { localStorage.setItem("mav-extra", JSON.stringify(extra)); } catch {}
+}
+
+async function iniciar() {
+  try {
+    const r = await fetch("historico-2026.json", { cache: "no-cache" });
+    if (r.ok) { const d = await r.json(); agregar(d.filas, d.consultadas); }
+  } catch {}
+  try {
+    const x = JSON.parse(localStorage.getItem("mav-extra") || "null");
+    if (x) { extra = x; agregar(x.filas, x.consultadas); }
+  } catch {}
+  armarFiltros();
+  irUltima();
+  await completar();
+}
+
+async function completar() {
+  const ult = ultimaRueda(), pend = [];
+  for (let f = DESDE_ANIO; f <= ult; f = sumarDias(f, 1)) if (esHabil(f) && !consultadas.has(f)) pend.push(f);
+  if (!pend.length) { estado(`Datos al día hasta ${ult}.`); return; }
+  const total = pend.length; let hechos = 0, fallidas = 0;
+  const nuevasF = [], nuevasC = [];
+  async function worker() {
+    while (pend.length) {
+      const f = pend.shift();
+      try {
+        const r = await fetch(`${PROXY}?fecha=${f}`);
+        if (!r.ok) throw 0;
+        const d = await r.json();
+        nuevasF.push(...(d.subastas || []).filter((s) => s.estado === "Negociada").map(reducir));
+        nuevasC.push(f);
+      } catch { fallidas++; }
+      estado(`Actualizando ruedas recientes: ${++hechos} de ${total}…`);
+    }
+  }
+  await Promise.all([worker(), worker(), worker()]);
+  agregar(nuevasF, nuevasC);
+  extra.filas.push(...nuevasF); extra.consultadas.push(...nuevasC); guardarExtra();
+  armarFiltros();
+  if (modoUltima) irUltima(); else render();
+  estado(fallidas ? `${fallidas} fechas no respondieron; se reintentan en la próxima visita.` : `Datos al día hasta ${ultimaRueda()}.`);
+}
+
+function armarFiltros() {
+  for (const [id, campo, todos] of [["instrumento", "instrumento", "Todos"], ["moneda", "moneda", "Todas"], ["segmento", "segmento", "Todos"]]) {
+    const sel = $(id), actual = sel.value;
+    const vals = [...new Set(filas.map((f) => f[campo]).filter(Boolean))].sort();
+    sel.innerHTML = `<option value="">${todos}</option>` + vals.map((v) => `<option>${esc(v)}</option>`).join("");
+    sel.value = vals.includes(actual) ? actual : "";
+  }
+  const fechas = filas.map((f) => f.fecha).sort();
+  if (fechas.length) {
+    $("desde").min = $("hasta").min = fechas[0];
+    $("desde").max = $("hasta").max = fechas[fechas.length - 1];
+  }
+}
+
+function irUltima() {
+  const fechas = filas.map((f) => f.fecha).sort();
+  const u = fechas[fechas.length - 1] || "";
+  $("desde").value = $("hasta").value = u; modoUltima = true; render();
+}
+
+function filtradas() {
+  const d = $("desde").value, h = $("hasta").value, i = $("instrumento").value, m = $("moneda").value, s = $("segmento").value;
+  return filas.filter((f) => f.fecha >= d && f.fecha <= h && (!i || f.instrumento === i) && (!m || f.moneda === m) && (!s || f.segmento === s));
+}
+
+const ponderada = (rows) => {
+  const c = rows.filter((r) => r.tasa_tea != null && r.monto);
+  const peso = c.reduce((a, r) => a + r.monto, 0);
+  return peso ? c.reduce((a, r) => a + r.tasa_tea * r.monto, 0) / peso : null;
+};
+
+function render() {
+  const rows = filtradas();
+  const todas = filas.map((f) => f.fecha).sort();
+  $("sub").textContent = todas.length ? `${filas.length.toLocaleString("es-AR")} operaciones negociadas entre ${todas[0]} y ${todas[todas.length - 1]}.` : "Todavía no hay datos cargados.";
+  resumen(rows); grafico(rows); detalle(rows);
+}
+
+function resumen(rows) {
+  if (!rows.length) { $("resumen").innerHTML = `<div class="vacio">No hubo operaciones con estos filtros. Probá con otra fecha o ampliá el rango.</div>`; return; }
+  const g = {};
+  rows.forEach((r) => (g[`${r.instrumento}|${r.moneda}`] ||= []).push(r));
+  const th = ["Instrumento", "Moneda", "Operaciones", "Monto", "TEA mínima", "TEA ponderada", "TEA máxima"];
+  const body = Object.entries(g).sort().map(([k, v]) => {
+    const [i, m] = k.split("|"), t = v.map((r) => r.tasa_tea).filter((x) => x != null);
+    return `<tr><td>${esc(i)}</td><td>${esc(m)}</td><td class="n">${v.length}</td><td class="n">${nf(v.reduce((a, r) => a + (r.monto || 0), 0), 0)}</td><td class="n">${t.length ? nf(Math.min(...t)) : "–"}</td><td class="n"><b>${nf(ponderada(v))}</b></td><td class="n">${t.length ? nf(Math.max(...t)) : "–"}</td></tr>`;
+  }).join("");
+  $("resumen").innerHTML = `<table><thead><tr>${th.map((h, i) => `<th class="${i > 1 ? "n" : ""}">${h}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function grafico(rows) {
+  const fechas = [...new Set(rows.map((r) => r.fecha))].sort();
+  if (fechas.length < 2) { $("grafico").innerHTML = `<div class="vacio">Elegí un rango de más de un día con operaciones para ver la evolución.</div>`; return; }
+  const series = {};
+  rows.forEach((r) => (series[`${r.instrumento} ${r.moneda}`] ||= []).push(r));
+  const pts = Object.entries(series).map(([k, v], i) => ({
+    k, color: COLORES[i % COLORES.length],
+    v: fechas.map((f) => ponderada(v.filter((r) => r.fecha === f)))
+  }));
+  const todos = pts.flatMap((s) => s.v).filter((x) => x != null);
+  if (!todos.length) { $("grafico").innerHTML = `<div class="vacio">Las operaciones del rango no informan TEA.</div>`; return; }
+  const W = 800, H = 260, L = 50, R = 12, T = 12, B = 28;
+  let lo = Math.min(...todos), hi = Math.max(...todos);
+  if (hi === lo) { hi += 1; lo -= 1; }
+  const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+  const x = (i) => L + (i / (fechas.length - 1)) * (W - L - R);
+  const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+  let svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="TEA ponderada por fecha">`;
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + ((hi - lo) * i) / 4;
+    svg += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="#d9dfe4"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="#5d6b76">${nf(v, 1)}</text>`;
+  }
+  [0, Math.floor((fechas.length - 1) / 2), fechas.length - 1].forEach((i) => {
+    svg += `<text x="${x(i)}" y="${H - 8}" text-anchor="${i === 0 ? "start" : i === fechas.length - 1 ? "end" : "middle"}" font-size="11" fill="#5d6b76">${fechas[i]}</text>`;
+  });
+  pts.forEach((s) => {
+    let d = "", pen = false;
+    s.v.forEach((v, i) => { if (v == null) { pen = false; return; } d += `${pen ? "L" : "M"}${x(i)},${y(v)}`; pen = true; });
+    svg += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.8"/>`;
+    s.v.forEach((v, i) => { if (v != null) svg += `<circle cx="${x(i)}" cy="${y(v)}" r="2.6" fill="${s.color}"><title>${esc(s.k)} · ${fechas[i]} · TEA ${nf(v)}</title></circle>`; });
+  });
+  $("grafico").innerHTML = svg + `</svg><div class="leyenda">${pts.map((s) => `<span><i style="background:${s.color}"></i>${esc(s.k)}</span>`).join("")}</div>`;
+}
+
+function detalle(rows) {
+  if (!rows.length) { $("detalle").innerHTML = `<div class="vacio">Sin operaciones para mostrar.</div>`; return; }
+  const orden = [...rows].sort((a, b) => b.fecha.localeCompare(a.fecha) || (b.monto || 0) - (a.monto || 0));
+  const MAX = 500, cols = [["Fecha", "fecha"], ["Instrumento", "instrumento"], ["Segmento", "segmento"], ["Moneda", "moneda"], ["Monto", "monto", 0], ["Tasa compradora", "tasa_compradora", 2], ["Tasa vendedora", "tasa_vendedora", 2], ["TEA", "tasa_tea", 2], ["TEM", "tasa_tem", 2], ["Agente comprador", "agente_comprador"], ["Agente vendedor", "agente_vendedor"], ["Responsable", "razon_social_responsable"], ["Garantía", "tipo_gtia"]];
+  const cab = cols.map((c) => `<th class="${c[2] != null ? "n" : ""}">${c[0]}</th>`).join("");
+  const cuerpo = orden.slice(0, MAX).map((r) => `<tr>${cols.map((c) => c[2] != null ? `<td class="n">${nf(r[c[1]], c[2])}</td>` : `<td>${esc(r[c[1]])}</td>`).join("")}</tr>`).join("");
+  $("detalle").innerHTML = `<table><thead><tr>${cab}</tr></thead><tbody>${cuerpo}</tbody></table>` + (orden.length > MAX ? `<div class="vacio">Se muestran las primeras ${MAX} de ${orden.length}. El CSV trae todas.</div>` : "");
+}
+
+function descargarCsv() {
+  const rows = filtradas();
+  const celda = (v) => { const s = v == null ? "" : typeof v === "number" ? String(v).replace(".", ",") : String(v); return /[;"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  const csv = "\ufeff" + CAMPOS.join(";") + "\n" + rows.map((r) => CAMPOS.map((c) => celda(r[c])).join(";")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  a.download = `mav-tasas-${$("desde").value}_${$("hasta").value}.csv`;
+  a.click(); URL.revokeObjectURL(a.href);
+}
+
+function descargarJson() {
+  const salida = { actualizado: new Date().toISOString(), consultadas: [...consultadas].sort(), filas: [...filas].sort((a, b) => a.fecha.localeCompare(b.fecha) || a.id_subasta - b.id_subasta) };
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(salida)], { type: "application/json" }));
+  a.download = "historico-2026.json";
+  a.click(); URL.revokeObjectURL(a.href);
+}
+$("btnJson").addEventListener("click", descargarJson);
+
+["desde", "hasta"].forEach((id) => $(id).addEventListener("change", () => { modoUltima = false; render(); }));
+["instrumento", "moneda", "segmento"].forEach((id) => $(id).addEventListener("change", render));
+$("btnUltima").addEventListener("click", irUltima);
+$("btnTodo").addEventListener("click", () => { $("desde").value = DESDE_ANIO; $("hasta").value = $("hasta").max; modoUltima = false; render(); });
+$("btnCsv").addEventListener("click", descargarCsv);
+iniciar();
+</script>
+</body>
+</html>
